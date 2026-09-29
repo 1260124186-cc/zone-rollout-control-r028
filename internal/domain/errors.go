@@ -8,19 +8,22 @@ import (
 type ErrorCode string
 
 const (
-	CodeValidationFailed    ErrorCode = "validation_failed"
-	CodeNotFound            ErrorCode = "not_found"
-	CodeInvalidState        ErrorCode = "invalid_state"
-	CodeVersionConflict     ErrorCode = "version_conflict"
-	CodeIdempotencyConflict ErrorCode = "idempotency_conflict"
-	CodeDuplicateRevision   ErrorCode = "duplicate_revision"
-	CodeNodeUnavailable     ErrorCode = "node_unavailable"
-	CodeLeaseExpired        ErrorCode = "lease_expired"
-	CodeLeaseNotClaimed     ErrorCode = "lease_not_claimed"
-	CodeNoProbes            ErrorCode = "no_probes"
-	CodeConflict            ErrorCode = "conflict"
-	CodeStorageFailure      ErrorCode = "storage_failure"
-	CodeInternal            ErrorCode = "internal_error"
+	CodeValidationFailed     ErrorCode = "validation_failed"
+	CodeNotFound             ErrorCode = "not_found"
+	CodeInvalidState         ErrorCode = "invalid_state"
+	CodeVersionConflict      ErrorCode = "version_conflict"
+	CodeIdempotencyConflict  ErrorCode = "idempotency_conflict"
+	CodeDuplicateRevision    ErrorCode = "duplicate_revision"
+	CodeNodeUnavailable      ErrorCode = "node_unavailable"
+	CodeLeaseExpired         ErrorCode = "lease_expired"
+	CodeLeaseNotClaimed      ErrorCode = "lease_not_claimed"
+	CodeNoProbes             ErrorCode = "no_probes"
+	CodeApprovalRequired     ErrorCode = "approval_required"
+	CodeApprovalConflict     ErrorCode = "approval_conflict"
+	CodeApprovalNotWithdrawn ErrorCode = "approval_not_withdrawable"
+	CodeConflict             ErrorCode = "conflict"
+	CodeStorageFailure       ErrorCode = "storage_failure"
+	CodeInternal             ErrorCode = "internal_error"
 )
 
 type DomainError struct {

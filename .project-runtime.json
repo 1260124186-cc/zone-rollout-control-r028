@@ -23,6 +23,18 @@
     {
       "workflow_id": "consistency-assessment",
       "command": "go run ./cmd/workflowprobe consistency-assessment"
+    },
+    {
+      "workflow_id": "approval-policy-disabled",
+      "command": "go run ./cmd/workflowprobe approval-policy-disabled"
+    },
+    {
+      "workflow_id": "dual-approval-gate",
+      "command": "go run ./cmd/workflowprobe dual-approval-gate"
+    },
+    {
+      "workflow_id": "approval-concurrent-activation",
+      "command": "go run ./cmd/workflowprobe approval-concurrent-activation"
     }
   ]
 }

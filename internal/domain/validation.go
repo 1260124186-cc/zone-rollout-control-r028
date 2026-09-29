@@ -19,10 +19,11 @@ const (
 )
 
 type PlanCreateInput struct {
-	Zone                string  `json:"zone"`
-	MinimumSuccessRatio float64 `json:"minimum_success_ratio"`
-	MaximumLatencyMS    int     `json:"maximum_latency_ms"`
-	ExpectedNodes       int     `json:"expected_nodes"`
+	Zone                 string  `json:"zone"`
+	MinimumSuccessRatio  float64 `json:"minimum_success_ratio"`
+	MaximumLatencyMS     int     `json:"maximum_latency_ms"`
+	ExpectedNodes        int     `json:"expected_nodes"`
+	RequiresDualApproval *bool   `json:"requires_dual_approval,omitempty"`
 }
 
 type RevisionCreateInput struct {

@@ -13,7 +13,9 @@ import (
 	"time"
 
 	"solo-0014-zone-rollout-control/internal/allocation"
+	"solo-0014-zone-rollout-control/internal/approval"
 	"solo-0014-zone-rollout-control/internal/assessment"
+	"solo-0014-zone-rollout-control/internal/domain"
 	"solo-0014-zone-rollout-control/internal/fleet"
 	"solo-0014-zone-rollout-control/internal/httpapi"
 	"solo-0014-zone-rollout-control/internal/plan"
@@ -31,7 +33,20 @@ type harness struct {
 	tempDir  string
 }
 
+// dualApprovalPolicy matches the server default when the gate is enabled.
+func dualApprovalPolicy(ttl time.Duration) plan.DualApprovalPolicy {
+	return plan.DualApprovalPolicy{
+		DefaultRequired: true,
+		RequiredRoles:   []domain.ApprovalRole{domain.RoleReviewer, domain.RoleApprover},
+		TTL:             ttl,
+	}
+}
+
 func newHarness() (*harness, error) {
+	return newHarnessWithPolicy(plan.DualApprovalPolicy{})
+}
+
+func newHarnessWithPolicy(policy plan.DualApprovalPolicy) (*harness, error) {
 	tempDir, err := os.MkdirTemp("", "zrc-probe-*")
 	if err != nil {
 		return nil, fmt.Errorf("create temporary directory: %w", err)
@@ -44,12 +59,19 @@ func newHarness() (*harness, error) {
 	clock := platform.NewManualClock(time.Date(2026, time.September, 25, 12, 0, 0, 0, time.UTC))
 	ids := platform.CryptoIDGenerator{}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	plans := plan.New(stateStore, clock, ids)
+	if policy.TTL == 0 {
+		policy.TTL = 24 * time.Hour
+	}
+	if len(policy.RequiredRoles) == 0 {
+		policy.RequiredRoles = []domain.ApprovalRole{domain.RoleReviewer, domain.RoleApprover}
+	}
+	approvals := approval.New(stateStore, clock, ids, policy.DomainPolicy())
+	plans := plan.New(stateStore, clock, ids, policy, approvals)
 	nodes := fleet.New(stateStore, clock, ids)
 	allocations := allocation.New(stateStore, clock, ids)
 	probes := probe.New(stateStore, clock, ids, allocations)
 	assessments := assessment.New(stateStore, clock, ids)
-	api := httpapi.New(plans, nodes, allocations, probes, assessments, ids, logger)
+	api := httpapi.New(plans, nodes, allocations, probes, assessments, approvals, ids, logger)
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

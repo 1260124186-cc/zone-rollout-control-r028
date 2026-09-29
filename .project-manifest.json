@@ -39,6 +39,11 @@
       "responsibility": "probe aggregation, deterministic verdicts, and latest result reads"
     },
     {
+      "id": "approval",
+      "path": "internal/approval",
+      "responsibility": "independent dual-approval ledger, withdrawal, read projections, and the activation gate"
+    },
+    {
       "id": "domain",
       "path": "internal/domain",
       "responsibility": "entities, DNS value validation, transitions, and stable errors"
@@ -151,6 +156,27 @@
         "httpapi",
         "assessment",
         "probe",
+        "domain",
+        "storage"
+      ]
+    },
+    {
+      "id": "dual-approval-gate",
+      "name": "Dual approval ledger and activation gate",
+      "entry": "POST /v1/plans/{id}/approvals -> PATCH /v1/plans/{id}/activate",
+      "steps": [
+        "bind each decision to the current plan version and immutable revision content server-side",
+        "require effective approvals from two distinct roles and distinct reviewers",
+        "invalidate withdrawn, expired, version-changed, and revision-changed evidence",
+        "evaluate the ledger inside the activation transaction under one lock"
+      ],
+      "success": "two distinct effective approvals release activation; the ledger exposes per-approval validity and a readiness summary",
+      "failure": "missing roles, single-reviewer dual roles, active rejections, forged body bindings, duplicate or conflicting decisions, and stale evidence all fail without partial writes",
+      "verification": "workflowprobe dual-approval-gate, approval-policy-disabled, and approval-concurrent-activation cover gating, compatibility, and concurrency",
+      "module_ids": [
+        "httpapi",
+        "approval",
+        "plan",
         "domain",
         "storage"
       ]

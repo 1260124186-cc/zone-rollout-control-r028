@@ -2,23 +2,61 @@ package plan
 
 import (
 	"context"
-	"encoding/json"
 	"reflect"
 	"sort"
+	"time"
 
 	"solo-0014-zone-rollout-control/internal/domain"
 	"solo-0014-zone-rollout-control/internal/platform"
 	"solo-0014-zone-rollout-control/internal/store"
 )
 
-type Service struct {
-	store *store.Store
-	clock platform.Clock
-	ids   platform.IDGenerator
+// ActivationGate proves, from the independent approval ledger inside the
+// activation transaction, that a still-valid dual approval exists for the
+// exact plan version being activated.
+type ActivationGate interface {
+	CheckActivation(
+		state *domain.State,
+		plan domain.RolloutPlan,
+		now time.Time,
+	) domain.ApprovalEvaluation
 }
 
-func New(stateStore *store.Store, clock platform.Clock, ids platform.IDGenerator) *Service {
-	return &Service{store: stateStore, clock: clock, ids: ids}
+// DualApprovalPolicy configures whether plans require dual approval by
+// default, which roles must sign, and how long approvals stay valid.
+type DualApprovalPolicy struct {
+	DefaultRequired bool
+	RequiredRoles   []domain.ApprovalRole
+	TTL             time.Duration
+}
+
+// DomainPolicy converts the plan policy into the domain-level policy used by
+// the approval service.
+func (p DualApprovalPolicy) DomainPolicy() domain.ApprovalPolicy {
+	return domain.ApprovalPolicy{RequiredRoles: p.RequiredRoles, TTL: p.TTL}
+}
+
+type Service struct {
+	store  *store.Store
+	clock  platform.Clock
+	ids    platform.IDGenerator
+	policy DualApprovalPolicy
+	gate   ActivationGate
+}
+
+func New(
+	stateStore *store.Store,
+	clock platform.Clock,
+	ids platform.IDGenerator,
+	policy DualApprovalPolicy,
+	gate ActivationGate,
+) *Service {
+	return &Service{store: stateStore, clock: clock, ids: ids, policy: policy, gate: gate}
+}
+
+// Policy exposes the resolved dual-approval policy for other services.
+func (s *Service) Policy() DualApprovalPolicy {
+	return s.policy
 }
 
 func (s *Service) Create(ctx context.Context, input domain.PlanCreateInput) (domain.RolloutPlan, error) {
@@ -27,15 +65,20 @@ func (s *Service) Create(ctx context.Context, input domain.PlanCreateInput) (dom
 	}
 	input = domain.NormalizePlanInput(input)
 	now := s.clock.Now().UTC()
+	requires := s.policy.DefaultRequired
+	if input.RequiresDualApproval != nil {
+		requires = *input.RequiresDualApproval
+	}
 	plan := domain.RolloutPlan{
-		ID:                  s.ids.New("pln"),
-		Zone:                input.Zone,
-		State:               domain.PlanDraft,
-		MinimumSuccessRatio: input.MinimumSuccessRatio,
-		MaximumLatencyMS:    input.MaximumLatencyMS,
-		ExpectedNodes:       input.ExpectedNodes,
-		Version:             1,
-		CreatedAt:           now,
+		ID:                   s.ids.New("pln"),
+		Zone:                 input.Zone,
+		State:                domain.PlanDraft,
+		MinimumSuccessRatio:  input.MinimumSuccessRatio,
+		MaximumLatencyMS:     input.MaximumLatencyMS,
+		ExpectedNodes:        input.ExpectedNodes,
+		Version:              1,
+		RequiresDualApproval: requires,
+		CreatedAt:            now,
 	}
 	err := s.store.Write(ctx, func(state *domain.State) error {
 		state.Plans[plan.ID] = plan
@@ -125,13 +168,38 @@ func (s *Service) Activate(
 		if current.Version != expectedVersion {
 			return versionConflict(planID, expectedVersion, current.Version)
 		}
+		// The transition legality takes precedence: once active, repeated
+		// activation is rejected as invalid regardless of approval state.
+		if current.State != domain.PlanDraft {
+			return domain.InvalidState("plan can be activated only from draft", map[string]any{
+				"plan_id": planID,
+				"state":   current.State,
+			})
+		}
 		now := s.clock.Now().UTC()
+		if current.RequiresDualApproval {
+			if s.gate == nil {
+				return domain.NewError(domain.CodeApprovalRequired, "dual approval policy is enabled but no approval ledger is configured", map[string]any{
+					"plan_id": planID,
+				})
+			}
+			evaluation := s.gate.CheckActivation(state, current, now)
+			if !evaluation.Ready {
+				return domain.NewError(domain.CodeApprovalRequired, "plan does not have a still-valid dual approval for this version", map[string]any{
+					"plan_id":       planID,
+					"plan_version":  current.Version,
+					"missing_roles": evaluation.MissingRoles,
+					"reasons":       evaluation.Reasons,
+				})
+			}
+		}
 		if err := domain.ActivatePlan(&current, now); err != nil {
 			return err
 		}
 		state.Plans[planID] = current
 		store.AddAudit(state, s.ids, "plan", planID, "activated", now, map[string]any{
-			"version": current.Version,
+			"version":                current.Version,
+			"requires_dual_approval": current.RequiresDualApproval,
 		})
 		plan = current
 		return nil
@@ -271,16 +339,7 @@ func (s *Service) RevisionExists(
 }
 
 func RevisionDigest(revision domain.ZoneRevision) string {
-	payload, _ := json.Marshal(struct {
-		Serial    uint32
-		Authority string
-		Entries   []domain.ZoneEntry
-	}{
-		Serial:    revision.Serial,
-		Authority: revision.Authority,
-		Entries:   revision.Entries,
-	})
-	return string(payload)
+	return domain.RevisionDigest(revision)
 }
 
 func versionConflict(id string, expected uint64, actual uint64) *domain.DomainError {

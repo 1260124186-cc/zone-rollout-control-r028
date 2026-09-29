@@ -25,6 +25,7 @@ Zone Rollout Control 是面向 DNS 运维人员的 Go HTTP 控制面。它把区
 - `maximum_latency_ms`：允许的最大探针延迟。
 - `expected_nodes`：计划预期参与的节点数，范围为 1 到 500。
 - `version`：每次计划聚合变化后递增。
+- `requires_dual_approval`：随计划持久化的双人审批策略位。
 - `latest_revision_id`：最近一次添加的区域版本。
 - `latest_assessment_id`：最近一次完成的一致性判定。
 - `created_at`、`activated_at`、`completed_at`：RFC3339 时间。
@@ -82,6 +83,22 @@ Zone Rollout Control 是面向 DNS 运维人员的 Go HTTP 控制面。它把区
 - `probe_count`、`success_count`、`success_ratio`、`maximum_latency_ms`。
 - `created_at`。
 
+### PlanApproval
+
+审批台账中的一条双人复核记录，独立于计划存在，只通过审批入口读写。
+
+- `id`、`plan_id`。
+- `plan_version`：记录时刻的计划聚合版本，不可变。
+- `revision_id`、`revision_serial`、`revision_fingerprint`：记录时刻最新区域版本的标识与内容指纹，均由服务在事务内计算，客户端无法在请求体中指定或伪造。
+- `role`：审批角色，取 `reviewer` 或 `approver`。
+- `reviewer_id`：复核人标识。
+- `decision`：`approved` 或 `rejected`。
+- `request_key`、`fingerprint`：审批写入的幂等键与仅覆盖客户端字段的载荷指纹。
+- `status`：`active` 或 `withdrawn`；记录内容不可变，撤回只翻转状态并记 `withdrawn_at`。
+- `created_at`、`expires_at`、`withdrawn_at`。
+
+读投影 `ApprovalView` 在记录之外附加 `current`、`effective` 和 `ineffective_code`（`withdrawn`、`expired`、`version_changed`、`revision_changed`），用于标记一条证据对当前计划是否仍有效。
+
 ## 4. 状态和规则
 
 ### 滚动计划状态
@@ -94,6 +111,32 @@ draft --activate--> active --complete--> completed
 - 只有 `active` 可以完成。
 - 激活后不能继续添加区域版本。
 - 激活和完成需要匹配当前版本。
+
+#### 双人审批策略
+
+`RolloutPlan.requires_dual_approval` 是随计划持久化的策略位：
+
+- 未启用全局策略时新建计划默认为 `false`；请求体可显式置为 `true` 单计划启用。
+- 通过 `--require-dual-approval` 启用全局策略后，新建计划默认为 `true`；请求体仍可显式置为 `false`。
+- 历史快照中的计划没有该字段，反序列化后为 `false`：即使之后以全局策略启动，既有计划仍按旧流程直接激活，保持兼容。
+
+启用双人审批的计划，激活必须由审批台账证明存在一组**仍有效**的批准：
+
+- 每个必需角色（默认 `reviewer`、`approver`）各有一条有效的 `approved` 记录。
+- 两个角色必须来自不同的 `reviewer_id`。
+- 每条记录都绑定记录时的 `plan_version` 和最新区域版本；撤回（`withdrawn`）、超过 `expires_at`（`expired`）、计划版本变化（`version_changed`）或区域版本变化（`revision_changed`）后立即失效。
+- 存在与当前版本匹配的有效 `rejected` 记录（`active_rejection`）时拒绝放行，即使两个批准角色已齐备。
+- 审批只在 `draft` 状态可记录和撤回；激活后台账记录冻结。
+- 审批绑定字段全部由服务在锁内计算，请求体只接受 `request_key`、`role`、`reviewer_id`、`decision`、`note`，严格解码会拒绝任何绑定字段。
+- 激活事务在同一把锁、同一状态副本内核验台账，证据检查与状态迁移之间没有读改写窗口。
+
+审批记录的确定边界：
+
+- 幂等：同计划同 `request_key` 同载荷重放返回原记录；同键异载荷返回 `idempotency_conflict`。
+- 重复审批：同一版本+区域版本下，一个角色只允许一条有效决策，重复返回 `approval_conflict`；同一复核人不得用第二个角色再次记录，重复返回 `approval_conflict`。
+- 撤回仅限本人、仅限 `draft`、仅可撤回一次，否则返回 `approval_not_withdrawable`。
+- 证据不足时激活返回 `approval_required`，并在 details 中给出 `missing_roles` 和稳定原因代码。
+- 激活本身的并发：状态合法性检查先于台账闸门，重复迁移统一返回 `invalid_state`；与 `expected_version` 不匹配返回 `version_conflict`。
 
 ### 节点与租约生命周期
 
@@ -212,6 +255,28 @@ ready --lease--> leased --report--> ready
 
 失败行为：缺少区域版本、没有探针、请求键冲突或保存失败不会更新计划摘要。
 
+### W5 双人审批与激活闸门
+
+入口：
+
+- `POST /v1/plans/{id}/approvals`
+- `GET /v1/plans/{id}/approvals`
+- `GET /v1/approvals/{approvalId}`
+- `POST /v1/approvals/{approvalId}/withdraw`
+- `PATCH /v1/plans/{id}/activate`（闸门在激活事务内生效）
+
+步骤：
+
+1. HTTP 层严格解码审批请求，只接受复核人控制的字段。
+2. 审批服务在锁内读取计划和最新区域版本，校验草稿状态、角色和策略。
+3. 服务计算计划版本、区域版本标识、序列号、内容指纹和过期时间，写入不可变记录与请求键索引。
+4. 激活时在同一事务内用纯领域计算评估每条记录的有效性，确认两个必需角色、两名不同复核人的仍有效批准。
+5. 只有评估通过才执行 `draft -> active` 迁移。
+
+成功行为：两名不同复核人分别以 `reviewer` 和 `approver` 批准当前版本后，计划可以激活；台账读接口返回每条记录的当前有效性和整计划的就绪摘要。
+
+失败行为：证据缺失、单人双角色、有效拒绝、记录撤回、记录过期、版本漂移、请求键冲突或非草稿状态都返回稳定错误且不产生部分写入；激活请求体无法提供任何审批证据。
+
 ## 6. 模块边界
 
 | 模块 | 路径 | 责任 |
@@ -223,6 +288,7 @@ ready --lease--> leased --report--> ready
 | allocation | `internal/allocation` | 节点筛选、幂等分配组和租约生命周期 |
 | probe | `internal/probe` | 探针校验、幂等写入和租约完成 |
 | assessment | `internal/assessment` | 探针聚合和一致性判定 |
+| approval | `internal/approval` | 独立审批台账的记录、撤回、读投影和激活闸门 |
 | domain | `internal/domain` | 聚合、值校验、状态迁移和纯计算 |
 | store | `internal/store` | 锁内副本事务和原子 JSON 持久化 |
 | platform | `internal/platform` | 时钟、标识、游标和文件锁 |
@@ -260,17 +326,22 @@ ready --lease--> leased --report--> ready
 - `PATCH /v1/leases/{id}/probes`
 - `PATCH /v1/plans/{id}/assessments`
 - `GET /v1/plans/{id}/assessments/latest`
+- `POST /v1/plans/{id}/approvals`
+- `GET /v1/plans/{id}/approvals`
+- `GET /v1/approvals/{approvalId}`
+- `POST /v1/approvals/{approvalId}/withdraw`
 
 ## 8. 工程机制
 
 - 状态迁移：计划、节点和租约使用显式迁移表。
 - 乐观并发：计划版本不匹配时拒绝变更。
-- 幂等写入：租约分配和探针登记都保存请求键和载荷指纹。
-- 资源生命周期：租约带截止时间，支持释放、完成和过期清理。
+- 幂等写入：租约分配、探针登记和审批记录都保存请求键和载荷指纹。
+- 资源生命周期：租约带截止时间，支持释放、完成和过期清理；审批带过期时间，撤回仅翻转状态。
+- 不可变绑定：审批记录在服务端绑定计划版本和区域版本内容指纹，激活在锁内重新核验证据有效性。
 - 原子持久化：事务先复制状态，成功后再通过临时文件替换快照。
 - 错误传播：领域错误稳定映射到 HTTP 状态和错误代码。
 - 边界校验：DNS 名称、IP、序列号、延迟、比例、分页和能力均显式验证。
-- 并发入口：HTTP 处理器可并发运行，状态修改通过互斥锁串行化。
+- 并发入口：HTTP 处理器可并发运行，状态修改通过互斥锁串行化；并发激活只有一个赢家。
 
 这些机制为后续工程任务提供了多个独立行为面，但本阶段不创建缺陷、不写测试，也不生成缺陷票据。
 
@@ -282,5 +353,8 @@ ready --lease--> leased --report--> ready
 2. 节点分配、租约唯一性、幂等重放和无可用节点冲突。
 3. 探针首写、同键重放、同键异载荷冲突和释放冲突。
 4. 一致性通过、审核触发、最新结果查询和幂等重放。
+5. 策略关闭时无审批直接激活、台账读接口可用，以及计划显式启用仍被闸门拦截。
+6. 双人审批：缺少角色、单人批准、双人放行、伪造绑定字段拒绝、重复角色/同人双角色冲突、同键异载荷冲突、拒绝阻断、撤回失效、过期失效和审批后追加版本失效。
+7. 并发激活只有一个请求成功，其余得到确定性的版本冲突或非法迁移错误。
 
 每条探针使用独立临时目录，不访问外部网络，结束后关闭服务。

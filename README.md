@@ -2,7 +2,7 @@
 
 Zone Rollout Control 是仅依赖 Go 标准库的本机 HTTP 控制面，用于协调区域版本上线。它管理滚动计划、不可变区域版本、解析节点租约、探针结果和一致性判定。
 
-本仓库是健康项目初始化基线。当前不包含单元测试、夹具或浏览器测试；测试工作有意延后到后续测试阶段。现在通过真实 HTTP 路由的生产探针验证构建和四条核心工作流。
+本仓库是健康项目初始化基线。当前不包含单元测试、夹具或浏览器测试；测试工作有意延后到后续测试阶段。现在通过真实 HTTP 路由的生产探针验证构建、四条核心工作流以及三条双人审批边界。
 
 ## 环境要求
 
@@ -29,8 +29,11 @@ go run ./cmd/zrc \
 - `--addr`：HTTP 监听地址，默认 `127.0.0.1:8090`。
 - `--state`：JSON 状态快照路径，默认 `data/zrc-state.json`。
 - `--shutdown-timeout`：中断后的关闭窗口，默认 `10s`。
+- `--require-dual-approval`：启用后新建计划默认要求双人审批才能激活，默认关闭。
+- `--approval-roles`：双人审批必需的两个不同角色，默认 `reviewer,approver`。
+- `--approval-ttl`：审批记录有效期，默认 `24h`。
 
-服务会锁定 `<state>.lock`，避免两个进程同时修改同一份状态。每次成功事务先复制状态，再通过同目录临时文件和原子替换写入快照。
+服务会锁定 `<state>.lock`，避免两个进程同时修改同一份状态。每次成功事务先复制状态，再通过同目录临时文件和原子替换写入快照。策略开关只影响新建计划的默认值；请求体可对单个计划显式设置 `requires_dual_approval`，历史计划（无该字段）始终按旧流程激活。
 
 ## 目录结构
 
@@ -45,6 +48,7 @@ internal/fleet              解析节点档案服务
 internal/allocation         节点选择和租约生命周期
 internal/probe              探针登记、幂等重放和租约完成
 internal/assessment         一致性聚合和最新结果查询
+internal/approval           独立审批台账、撤回和激活闸门
 internal/httpapi            HTTP 路由、中间件和响应映射
 internal/workflowprobe      真实 HTTP 路径验证
 ```
@@ -99,6 +103,39 @@ curl -sS -X PATCH http://127.0.0.1:8090/v1/plans/<plan_id>/activate \
   -H 'Content-Type: application/json' \
   -d '{"expected_version": 2}'
 ```
+
+要求双人审批的计划需先由两名不同复核人分别以 `reviewer` 和 `approver` 角色批准同一版本（或在创建计划时用 `--require-dual-approval` 打开全局默认）：
+
+```bash
+# 创建时对单个计划启用策略
+curl -sS -X PUT http://127.0.0.1:8090/v1/plans \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "zone": "edge.example",
+    "minimum_success_ratio": 1,
+    "maximum_latency_ms": 80,
+    "expected_nodes": 2,
+    "requires_dual_approval": true
+  }'
+
+# 两名不同复核人记录审批（必须在添加区域版本之后）
+curl -sS -X POST http://127.0.0.1:8090/v1/plans/<plan_id>/approvals \
+  -H 'Content-Type: application/json' \
+  -d '{"request_key": "review-0001", "role": "reviewer", "reviewer_id": "alice.review", "decision": "approved"}'
+curl -sS -X POST http://127.0.0.1:8090/v1/plans/<plan_id>/approvals \
+  -H 'Content-Type: application/json' \
+  -d '{"request_key": "approve-0001", "role": "approver", "reviewer_id": "bob.approve", "decision": "approved"}'
+
+# 查看台账及就绪状态
+curl -sS http://127.0.0.1:8090/v1/plans/<plan_id>/approvals
+
+# 复核人本人可在计划仍是草稿时撤回
+curl -sS -X POST http://127.0.0.1:8090/v1/approvals/<approval_id>/withdraw \
+  -H 'Content-Type: application/json' \
+  -d '{"reviewer_id": "alice.review"}'
+```
+
+审批只接受 `request_key`、`role`、`reviewer_id`、`decision`、`note`；计划版本、区域版本、内容指纹和过期时间全部由服务计算。撤回、过期或审批后追加区域版本都会让证据失效，激活返回 `approval_required`。
 
 分配节点租约：
 
@@ -178,6 +215,10 @@ curl -sS -X PATCH http://127.0.0.1:8090/v1/plans/<plan_id>/assessments \
 | `PATCH` | `/v1/leases/{id}/probes` | 登记探针并完成租约 |
 | `PATCH` | `/v1/plans/{id}/assessments` | 创建一致性判定 |
 | `GET` | `/v1/plans/{id}/assessments/latest` | 查询最近判定 |
+| `POST` | `/v1/plans/{id}/approvals` | 记录双人审批结论（幂等） |
+| `GET` | `/v1/plans/{id}/approvals` | 查询计划审批台账与就绪摘要 |
+| `GET` | `/v1/approvals/{id}` | 查询单条审批及当前有效性 |
+| `POST` | `/v1/approvals/{id}/withdraw` | 由复核人本人撤回审批 |
 
 ## 状态及失败行为
 
@@ -188,6 +229,9 @@ curl -sS -X PATCH http://127.0.0.1:8090/v1/plans/<plan_id>/assessments \
 - 一个节点同一时刻最多有一个 `claimed` 租约。
 - 相同请求键和相同内容可安全重放；同键异载荷返回 `idempotency_conflict`。
 - 一致性判定综合节点覆盖率、序列号、成功比例和最大延迟，返回 `consistent` 或 `review_required`。
+- 启用双人审批的计划必须持有两个不同角色、不同复核人、仍有效的批准才能激活；撤回、过期、有效拒绝或版本漂移都不放行。
+- 审批绑定字段由服务端计算，请求体伪造的版本、区域版本、状态或过期时间会被严格解码拒绝。
+- 策略关闭（默认）时，历史计划和显式 `requires_dual_approval:false` 的计划保持原有无审批激活流程。
 - 所有校验和冲突在快照替换前返回，不留下部分状态。
 
 ## 后续工程任务的行为边界
@@ -216,6 +260,9 @@ go run ./cmd/workflowprobe plan-revision-lifecycle
 go run ./cmd/workflowprobe node-lease-allocation
 go run ./cmd/workflowprobe probe-ingestion
 go run ./cmd/workflowprobe consistency-assessment
+go run ./cmd/workflowprobe approval-policy-disabled
+go run ./cmd/workflowprobe dual-approval-gate
+go run ./cmd/workflowprobe approval-concurrent-activation
 ```
 
 探针不访问外部网络，也不依赖已有状态文件。

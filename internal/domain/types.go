@@ -42,6 +42,27 @@ const (
 	EntryCNAME EntryType = "CNAME"
 )
 
+type ApprovalRole string
+
+const (
+	RoleReviewer ApprovalRole = "reviewer"
+	RoleApprover ApprovalRole = "approver"
+)
+
+type ApprovalDecision string
+
+const (
+	DecisionApproved ApprovalDecision = "approved"
+	DecisionRejected ApprovalDecision = "rejected"
+)
+
+type ApprovalStatus string
+
+const (
+	ApprovalActive    ApprovalStatus = "active"
+	ApprovalWithdrawn ApprovalStatus = "withdrawn"
+)
+
 type ZoneEntry struct {
 	Owner string    `json:"owner"`
 	Type  EntryType `json:"type"`
@@ -59,18 +80,19 @@ type ZoneRevision struct {
 }
 
 type RolloutPlan struct {
-	ID                  string     `json:"id"`
-	Zone                string     `json:"zone"`
-	State               PlanState  `json:"state"`
-	MinimumSuccessRatio float64    `json:"minimum_success_ratio"`
-	MaximumLatencyMS    int        `json:"maximum_latency_ms"`
-	ExpectedNodes       int        `json:"expected_nodes"`
-	Version             uint64     `json:"version"`
-	LatestRevisionID    string     `json:"latest_revision_id,omitempty"`
-	LatestAssessmentID  string     `json:"latest_assessment_id,omitempty"`
-	CreatedAt           time.Time  `json:"created_at"`
-	ActivatedAt         *time.Time `json:"activated_at,omitempty"`
-	CompletedAt         *time.Time `json:"completed_at,omitempty"`
+	ID                   string     `json:"id"`
+	Zone                 string     `json:"zone"`
+	State                PlanState  `json:"state"`
+	MinimumSuccessRatio  float64    `json:"minimum_success_ratio"`
+	MaximumLatencyMS     int        `json:"maximum_latency_ms"`
+	ExpectedNodes        int        `json:"expected_nodes"`
+	Version              uint64     `json:"version"`
+	RequiresDualApproval bool       `json:"requires_dual_approval"`
+	LatestRevisionID     string     `json:"latest_revision_id,omitempty"`
+	LatestAssessmentID   string     `json:"latest_assessment_id,omitempty"`
+	CreatedAt            time.Time  `json:"created_at"`
+	ActivatedAt          *time.Time `json:"activated_at,omitempty"`
+	CompletedAt          *time.Time `json:"completed_at,omitempty"`
 }
 
 type ResolverNode struct {
@@ -133,6 +155,75 @@ type RolloutAssessment struct {
 	CreatedAt        time.Time `json:"created_at"`
 }
 
+// PlanApproval is one immutable binding of a reviewer's decision to the
+// exact plan version and zone revision content that was reviewed. The only
+// mutation a stored approval admits is withdrawal of a still-active decision.
+type PlanApproval struct {
+	ID                  string           `json:"id"`
+	PlanID              string           `json:"plan_id"`
+	PlanVersion         uint64           `json:"plan_version"`
+	RevisionID          string           `json:"revision_id"`
+	RevisionSerial      uint32           `json:"revision_serial"`
+	RevisionFingerprint string           `json:"revision_fingerprint"`
+	Role                ApprovalRole     `json:"role"`
+	ReviewerID          string           `json:"reviewer_id"`
+	Decision            ApprovalDecision `json:"decision"`
+	Note                string           `json:"note,omitempty"`
+	RequestKey          string           `json:"request_key"`
+	Fingerprint         string           `json:"fingerprint"`
+	Status              ApprovalStatus   `json:"status"`
+	CreatedAt           time.Time        `json:"created_at"`
+	ExpiresAt           time.Time        `json:"expires_at"`
+	WithdrawnAt         *time.Time       `json:"withdrawn_at,omitempty"`
+}
+
+// ApprovalView is the read projection of an approval with its validity
+// evaluated against the current plan at a given instant.
+type ApprovalView struct {
+	PlanApproval
+	Current         bool   `json:"current"`
+	Effective       bool   `json:"effective"`
+	IneffectiveCode string `json:"ineffective_code,omitempty"`
+}
+
+// ApprovalSummary describes whether a plan can be activated under a
+// dual-approval policy and which approvals back that answer.
+type ApprovalSummary struct {
+	PlanID           string         `json:"plan_id"`
+	PlanVersion      uint64         `json:"plan_version"`
+	RevisionID       string         `json:"revision_id,omitempty"`
+	Required         bool           `json:"required"`
+	RequiredRoles    []ApprovalRole `json:"required_roles,omitempty"`
+	Ready            bool           `json:"ready"`
+	MissingRoles     []ApprovalRole `json:"missing_roles,omitempty"`
+	Reasons          []string       `json:"reasons,omitempty"`
+	Approvals        []ApprovalView `json:"approvals"`
+	ActiveRejections []string       `json:"active_rejections,omitempty"`
+}
+
+// ApprovalEvaluation is the result of evaluating an activation against the
+// approval ledger. A zero evaluation with Ready == true means the ledger
+// proves a still-valid dual approval for the requested version.
+type ApprovalEvaluation struct {
+	Ready        bool
+	MissingRoles []ApprovalRole
+	Reasons      []string
+}
+
+type ApprovalPolicy struct {
+	RequiredRoles []ApprovalRole
+	TTL           time.Duration
+}
+
+func (p ApprovalPolicy) RequiresRole(role ApprovalRole) bool {
+	for _, required := range p.RequiredRoles {
+		if required == role {
+			return true
+		}
+	}
+	return false
+}
+
 type AuditEvent struct {
 	ID         string         `json:"id"`
 	EntityType string         `json:"entity_type"`
@@ -152,8 +243,10 @@ type State struct {
 	LeaseGroups           map[string]LeaseGroup        `json:"lease_groups"`
 	Probes                map[string]Probe             `json:"probes"`
 	Assessments           map[string]RolloutAssessment `json:"assessments"`
+	Approvals             map[string]PlanApproval      `json:"approvals"`
 	LeaseRequestKeys      map[string]string            `json:"lease_request_keys"`
 	AssessmentRequestKeys map[string]string            `json:"assessment_request_keys"`
+	ApprovalRequestKeys   map[string]string            `json:"approval_request_keys"`
 	AuditEvents           []AuditEvent                 `json:"audit_events"`
 }
 
