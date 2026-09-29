@@ -45,6 +45,7 @@ internal/fleet              解析节点档案服务
 internal/allocation         节点选择和租约生命周期
 internal/probe              探针登记、幂等重放和租约完成
 internal/assessment         一致性聚合和最新结果查询
+internal/approval           独立审批台账、幂等登记和撤回
 internal/httpapi            HTTP 路由、中间件和响应映射
 internal/workflowprobe      真实 HTTP 路径验证
 ```
@@ -64,7 +65,7 @@ curl -sS -X PUT http://127.0.0.1:8090/v1/nodes \
   }'
 ```
 
-创建滚动计划：
+创建滚动计划（默认 `approval_policy` 为 `none`，与历史计划一致）：
 
 ```bash
 curl -sS -X PUT http://127.0.0.1:8090/v1/plans \
@@ -76,6 +77,60 @@ curl -sS -X PUT http://127.0.0.1:8090/v1/plans \
     "expected_nodes": 2
   }'
 ```
+
+高风险区域可在创建时声明 `dual_role`，激活前必须取得两个不同角色的有效批准：
+
+```bash
+curl -sS -X PUT http://127.0.0.1:8090/v1/plans \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "zone": "edge.example",
+    "minimum_success_ratio": 1,
+    "maximum_latency_ms": 80,
+    "expected_nodes": 2,
+    "approval_policy": "dual_role"
+  }'
+```
+
+添加区域版本并取得双人审批（两个角色必须由不同审批人登记，默认有效期 24 小时）：
+
+```bash
+curl -sS -X PATCH http://127.0.0.1:8090/v1/plans/<plan_id>/approvals \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "request_key": "approval-risk-0001",
+    "role": "risk_reviewer",
+    "approver": "risk-a",
+    "decision": "approved"
+  }'
+
+curl -sS -X PATCH http://127.0.0.1:8090/v1/plans/<plan_id>/approvals \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "request_key": "approval-zone-0001",
+    "role": "zone_owner",
+    "approver": "owner-a",
+    "decision": "approved",
+    "expires_in_seconds": 3600
+  }'
+```
+
+审批人撤回自己的批准（撤回后该批准永久失效）：
+
+```bash
+curl -sS -X PATCH http://127.0.0.1:8090/v1/approvals/<approval_id>/withdraw \
+  -H 'Content-Type: application/json' \
+  -d '{"request_key": "withdraw-0001", "approver": "risk-a"}'
+```
+
+查询独立审批台账：
+
+```bash
+curl -sS http://127.0.0.1:8090/v1/plans/<plan_id>/approvals
+curl -sS http://127.0.0.1:8090/v1/approvals/<approval_id>
+```
+
+激活 `dual_role` 计划时请求体仍然只接受 `expected_version`；审批不能经激活正文伪造。
 
 添加区域版本：
 
@@ -171,8 +226,12 @@ curl -sS -X PATCH http://127.0.0.1:8090/v1/plans/<plan_id>/assessments \
 | `GET` | `/v1/plans` | 按状态分页查询计划 |
 | `GET` | `/v1/plans/{id}` | 查询计划 |
 | `PATCH` | `/v1/plans/{id}/revisions` | 添加区域版本 |
-| `PATCH` | `/v1/plans/{id}/activate` | 激活计划 |
+| `PATCH` | `/v1/plans/{id}/activate` | 激活计划（dual_role 需双人有效批准） |
 | `PATCH` | `/v1/plans/{id}/complete` | 完成计划 |
+| `PATCH` | `/v1/plans/{id}/approvals` | 登记一条审批（幂等） |
+| `GET` | `/v1/plans/{id}/approvals` | 分页查询计划审批台账 |
+| `GET` | `/v1/approvals/{approval_id}` | 查询单条审批 |
+| `PATCH` | `/v1/approvals/{approval_id}/withdraw` | 原审批人撤回批准 |
 | `PATCH` | `/v1/plans/{id}/leases` | 给节点分配租约 |
 | `PATCH` | `/v1/leases/{id}/release` | 提前释放租约 |
 | `PATCH` | `/v1/leases/{id}/probes` | 登记探针并完成租约 |
@@ -188,6 +247,10 @@ curl -sS -X PATCH http://127.0.0.1:8090/v1/plans/<plan_id>/assessments \
 - 一个节点同一时刻最多有一个 `claimed` 租约。
 - 相同请求键和相同内容可安全重放；同键异载荷返回 `idempotency_conflict`。
 - 一致性判定综合节点覆盖率、序列号、成功比例和最大延迟，返回 `consistent` 或 `review_required`。
+- `approval_policy=none`（含字段缺失的历史快照）激活不要求审批；`dual_role` 计划激活时必须有两个不同审批人、两个角色（`risk_reviewer`、`zone_owner`）的仍有效 `approved` 记录。
+- 审批在服务端绑定当前区域版本 ID、不可变内容摘要和计划版本；版本被追加、审批撤回或过期后旧批准不再放行，需要重新双人审批。
+- 同一角色对同一版本的有效审批重复登记返回 `conflict`；同请求键同内容安全重放，同键异载荷返回 `idempotency_conflict`。
+- 并发激活由乐观版本串行化，恰好一个成功，其余返回 `version_conflict`。
 - 所有校验和冲突在快照替换前返回，不留下部分状态。
 
 ## 后续工程任务的行为边界
@@ -216,6 +279,7 @@ go run ./cmd/workflowprobe plan-revision-lifecycle
 go run ./cmd/workflowprobe node-lease-allocation
 go run ./cmd/workflowprobe probe-ingestion
 go run ./cmd/workflowprobe consistency-assessment
+go run ./cmd/workflowprobe dual-role-approval-gate
 ```
 
 探针不访问外部网络，也不依赖已有状态文件。

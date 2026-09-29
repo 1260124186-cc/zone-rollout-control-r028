@@ -20,6 +20,8 @@ func Run(args []string, output io.Writer) error {
 		run = runProbeIngestion
 	case "consistency-assessment":
 		run = runConsistencyAssessment
+	case "dual-role-approval-gate":
+		run = runDualRoleApprovalGate
 	default:
 		return fmt.Errorf("unsupported workflow %q", args[0])
 	}

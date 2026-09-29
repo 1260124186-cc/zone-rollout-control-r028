@@ -34,6 +34,34 @@ const (
 	VerdictReviewRequired Verdict = "review_required"
 )
 
+type ApprovalPolicy string
+
+const (
+	ApprovalPolicyNone     ApprovalPolicy = "none"
+	ApprovalPolicyDualRole ApprovalPolicy = "dual_role"
+)
+
+type ApprovalRole string
+
+const (
+	ApprovalRoleRiskReviewer ApprovalRole = "risk_reviewer"
+	ApprovalRoleZoneOwner    ApprovalRole = "zone_owner"
+)
+
+type ApprovalDecision string
+
+const (
+	ApprovalDecisionApproved ApprovalDecision = "approved"
+	ApprovalDecisionRejected ApprovalDecision = "rejected"
+)
+
+type ApprovalStatus string
+
+const (
+	ApprovalStatusActive    ApprovalStatus = "active"
+	ApprovalStatusWithdrawn ApprovalStatus = "withdrawn"
+)
+
 type EntryType string
 
 const (
@@ -59,18 +87,19 @@ type ZoneRevision struct {
 }
 
 type RolloutPlan struct {
-	ID                  string     `json:"id"`
-	Zone                string     `json:"zone"`
-	State               PlanState  `json:"state"`
-	MinimumSuccessRatio float64    `json:"minimum_success_ratio"`
-	MaximumLatencyMS    int        `json:"maximum_latency_ms"`
-	ExpectedNodes       int        `json:"expected_nodes"`
-	Version             uint64     `json:"version"`
-	LatestRevisionID    string     `json:"latest_revision_id,omitempty"`
-	LatestAssessmentID  string     `json:"latest_assessment_id,omitempty"`
-	CreatedAt           time.Time  `json:"created_at"`
-	ActivatedAt         *time.Time `json:"activated_at,omitempty"`
-	CompletedAt         *time.Time `json:"completed_at,omitempty"`
+	ID                  string         `json:"id"`
+	Zone                string         `json:"zone"`
+	State               PlanState      `json:"state"`
+	MinimumSuccessRatio float64        `json:"minimum_success_ratio"`
+	MaximumLatencyMS    int            `json:"maximum_latency_ms"`
+	ExpectedNodes       int            `json:"expected_nodes"`
+	ApprovalPolicy      ApprovalPolicy `json:"approval_policy,omitempty"`
+	Version             uint64         `json:"version"`
+	LatestRevisionID    string         `json:"latest_revision_id,omitempty"`
+	LatestAssessmentID  string         `json:"latest_assessment_id,omitempty"`
+	CreatedAt           time.Time      `json:"created_at"`
+	ActivatedAt         *time.Time     `json:"activated_at,omitempty"`
+	CompletedAt         *time.Time     `json:"completed_at,omitempty"`
 }
 
 type ResolverNode struct {
@@ -133,6 +162,24 @@ type RolloutAssessment struct {
 	CreatedAt        time.Time `json:"created_at"`
 }
 
+type PlanApproval struct {
+	ID                 string           `json:"id"`
+	PlanID             string           `json:"plan_id"`
+	RevisionID         string           `json:"revision_id"`
+	RevisionDigest     string           `json:"revision_digest"`
+	PlanVersion        uint64           `json:"plan_version"`
+	Role               ApprovalRole     `json:"role"`
+	Approver           string           `json:"approver"`
+	Decision           ApprovalDecision `json:"decision"`
+	Status             ApprovalStatus   `json:"status"`
+	Note               string           `json:"note,omitempty"`
+	RequestKey         string           `json:"request_key"`
+	RequestFingerprint string           `json:"request_fingerprint"`
+	CreatedAt          time.Time        `json:"created_at"`
+	ExpiresAt          time.Time        `json:"expires_at"`
+	WithdrawnAt        *time.Time       `json:"withdrawn_at,omitempty"`
+}
+
 type AuditEvent struct {
 	ID         string         `json:"id"`
 	EntityType string         `json:"entity_type"`
@@ -152,8 +199,10 @@ type State struct {
 	LeaseGroups           map[string]LeaseGroup        `json:"lease_groups"`
 	Probes                map[string]Probe             `json:"probes"`
 	Assessments           map[string]RolloutAssessment `json:"assessments"`
+	Approvals             map[string]PlanApproval      `json:"approvals"`
 	LeaseRequestKeys      map[string]string            `json:"lease_request_keys"`
 	AssessmentRequestKeys map[string]string            `json:"assessment_request_keys"`
+	ApprovalRequestKeys   map[string]string            `json:"approval_request_keys"`
 	AuditEvents           []AuditEvent                 `json:"audit_events"`
 }
 
@@ -169,5 +218,10 @@ type PlanPage struct {
 
 type NodePage struct {
 	Items []ResolverNode `json:"items"`
+	Meta  PageMeta       `json:"meta"`
+}
+
+type ApprovalPage struct {
+	Items []PlanApproval `json:"items"`
 	Meta  PageMeta       `json:"meta"`
 }

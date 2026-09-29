@@ -24,6 +24,7 @@ Zone Rollout Control 是面向 DNS 运维人员的 Go HTTP 控制面。它把区
 - `minimum_success_ratio`：成功节点占比下限，范围为 0 到 1。
 - `maximum_latency_ms`：允许的最大探针延迟。
 - `expected_nodes`：计划预期参与的节点数，范围为 1 到 500。
+- `approval_policy`：审批策略，`none`（默认）或 `dual_role`。
 - `version`：每次计划聚合变化后递增。
 - `latest_revision_id`：最近一次添加的区域版本。
 - `latest_assessment_id`：最近一次完成的一致性判定。
@@ -82,6 +83,20 @@ Zone Rollout Control 是面向 DNS 运维人员的 Go HTTP 控制面。它把区
 - `probe_count`、`success_count`、`success_ratio`、`maximum_latency_ms`。
 - `created_at`。
 
+### PlanApproval
+
+独立审批台账中的一条复核记录。审批内容只能经审批入口写入，激活请求正文不能伪造。
+
+- `id`、`plan_id`、`revision_id`：审批与具体计划和区域版本绑定。
+- `revision_digest`：区域版本不可变内容（序列号、权威、条目）的 SHA-256 摘要，由服务端从当前版本计算。
+- `plan_version`：审批时刻的计划版本。
+- `role`：`risk_reviewer` 或 `zone_owner`，两个角色必须由不同审批人持有。
+- `approver`、`decision`：`approved` 或 `rejected`。
+- `status`：`active` 或 `withdrawn`；撤回永久生效。
+- `expires_at`：审批有效期，默认 24 小时，允许范围 10 分钟到 7 天。
+- `request_key`、`request_fingerprint`：请求幂等键与仅覆盖客户端载荷的指纹。
+- `created_at`、`withdrawn_at`。
+
 ## 4. 状态和规则
 
 ### 滚动计划状态
@@ -94,6 +109,11 @@ draft --activate--> active --complete--> completed
 - 只有 `active` 可以完成。
 - 激活后不能继续添加区域版本。
 - 激活和完成需要匹配当前版本。
+- `approval_policy=none`（含历史快照中字段缺失的计划）激活不需要审批，保持兼容。
+- `approval_policy=dual_role` 激活时必须存在两条仍有效的 `approved` 记录，分别来自两个角色且审批人不同；记录必须绑定当前 `revision_id`、`revision_digest` 和 `plan_version`。撤回、过期、被否决、同审批人或版本/版本内容变化都不放行。
+- 审批只能在计划 `draft` 期间登记；同一角色对同一版本已有有效记录时重复登记返回 `conflict`，但同请求键同内容重放返回原记录，同键异载荷返回 `idempotency_conflict`。撤回/过期或新版本后可重新登记。
+- 撤回只能由原审批人发起；撤回记录永久失效。
+- 并发激活以乐观版本串行化：一个成功，另一个收到 `version_conflict`。
 
 ### 节点与租约生命周期
 
@@ -212,6 +232,27 @@ ready --lease--> leased --report--> ready
 
 失败行为：缺少区域版本、没有探针、请求键冲突或保存失败不会更新计划摘要。
 
+### W5 双人审批闸门
+
+入口：
+
+- `PATCH /v1/plans/{id}/approvals`
+- `GET /v1/plans/{id}/approvals`
+- `GET /v1/approvals/{approval_id}`
+- `PATCH /v1/approvals/{approval_id}/withdraw`
+- `PATCH /v1/plans/{id}/activate`（闸门校验）
+
+步骤：
+
+1. HTTP 层严格解码审批请求；角色、结论、审批人和有效期显式校验。
+2. 审批服务在写事务内读取服务端当前计划、最新版本和不可变内容摘要，绑定到台账记录。
+3. 记录写入独立 `approvals` 台账和请求键索引，审计同步落账。
+4. 激活 `dual_role` 计划时，纯领域闸门只接受仍有效、双角色、不同审批人、绑定当前版本与版本摘要的批准。
+
+成功行为：两个角色的有效批准放行激活；同键同内容重放返回原台账记录。
+
+失败行为：无审批/单角色/被否决/同人/撤回/过期/版本或摘要不匹配返回 `invalid_state`；激活正文夹带审批字段被严格解码拒绝；重复审批返回 `conflict`；同键异载荷返回 `idempotency_conflict`；并发激活只有一个成功。
+
 ## 6. 模块边界
 
 | 模块 | 路径 | 责任 |
@@ -223,6 +264,7 @@ ready --lease--> leased --report--> ready
 | allocation | `internal/allocation` | 节点筛选、幂等分配组和租约生命周期 |
 | probe | `internal/probe` | 探针校验、幂等写入和租约完成 |
 | assessment | `internal/assessment` | 探针聚合和一致性判定 |
+| approval | `internal/approval` | 独立审批台账、幂等登记、撤回和有效期 |
 | domain | `internal/domain` | 聚合、值校验、状态迁移和纯计算 |
 | store | `internal/store` | 锁内副本事务和原子 JSON 持久化 |
 | platform | `internal/platform` | 时钟、标识、游标和文件锁 |
@@ -255,6 +297,10 @@ ready --lease--> leased --report--> ready
 - `PATCH /v1/plans/{id}/revisions`
 - `PATCH /v1/plans/{id}/activate`
 - `PATCH /v1/plans/{id}/complete`
+- `PATCH /v1/plans/{id}/approvals`
+- `GET /v1/plans/{id}/approvals`
+- `GET /v1/approvals/{approval_id}`
+- `PATCH /v1/approvals/{approval_id}/withdraw`
 - `PATCH /v1/plans/{id}/leases`
 - `PATCH /v1/leases/{id}/release`
 - `PATCH /v1/leases/{id}/probes`
@@ -282,5 +328,6 @@ ready --lease--> leased --report--> ready
 2. 节点分配、租约唯一性、幂等重放和无可用节点冲突。
 3. 探针首写、同键重放、同键异载荷冲突和释放冲突。
 4. 一致性通过、审核触发、最新结果查询和幂等重放。
+5. 双人审批：无审批拒绝、双角色放行、正文伪造拒绝、重复/冲突、同人/撤回/过期/版本失效和并发激活。
 
 每条探针使用独立临时目录，不访问外部网络，结束后关闭服务。

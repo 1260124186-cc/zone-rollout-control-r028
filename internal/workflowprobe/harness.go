@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"solo-0014-zone-rollout-control/internal/allocation"
+	"solo-0014-zone-rollout-control/internal/approval"
 	"solo-0014-zone-rollout-control/internal/assessment"
 	"solo-0014-zone-rollout-control/internal/fleet"
 	"solo-0014-zone-rollout-control/internal/httpapi"
@@ -49,7 +50,8 @@ func newHarness() (*harness, error) {
 	allocations := allocation.New(stateStore, clock, ids)
 	probes := probe.New(stateStore, clock, ids, allocations)
 	assessments := assessment.New(stateStore, clock, ids)
-	api := httpapi.New(plans, nodes, allocations, probes, assessments, ids, logger)
+	approvals := approval.New(stateStore, clock, ids)
+	api := httpapi.New(plans, nodes, allocations, probes, assessments, approvals, ids, logger)
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

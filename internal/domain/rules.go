@@ -3,6 +3,7 @@ package domain
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"math"
 	"sort"
@@ -133,6 +134,145 @@ func BuildAssessment(
 func round(value float64, places int) float64 {
 	scale := math.Pow10(places)
 	return math.Round(value*scale) / scale
+}
+
+// DefaultApprovalTTL is applied when the approver does not state a TTL.
+const DefaultApprovalTTL = 24 * time.Hour
+
+// RevisionDigest is the immutable fingerprint of a zone revision's content.
+// Approvals bind to it, so a revision can never be silently swapped underneath
+// an existing approval.
+func RevisionDigest(revision ZoneRevision) string {
+	payload, _ := json.Marshal(struct {
+		Serial    uint32
+		Authority string
+		Entries   []ZoneEntry
+	}{
+		Serial:    revision.Serial,
+		Authority: revision.Authority,
+		Entries:   revision.Entries,
+	})
+	sum := sha256.Sum256(payload)
+	return hex.EncodeToString(sum[:])
+}
+
+// ApprovalRequestFingerprint covers only the client-supplied approval payload.
+// Server-side bindings (revision id, immutable digest, plan version) are stored
+// as explicit columns, never taken from the body, so a replay cannot forge
+// what was approved. The TTL is normalized to its effective value before
+// hashing so omitting it matches a replay that also omits it.
+func ApprovalRequestFingerprint(planID string, input ApprovalCreateInput) string {
+	ttl := input.ExpiresInSeconds
+	if ttl == 0 {
+		ttl = int(DefaultApprovalTTL / time.Second)
+	}
+	payload := fmt.Sprintf(
+		"%s|%s|%s|%s|%s|%s|%d",
+		planID,
+		input.RequestKey,
+		input.Role,
+		input.Approver,
+		input.Decision,
+		input.Note,
+		ttl,
+	)
+	sum := sha256.Sum256([]byte(payload))
+	return hex.EncodeToString(sum[:])
+}
+
+// EffectiveApprovalPolicy treats historical snapshots without a stored policy
+// as ApprovalPolicyNone so legacy plans keep activating without approvals.
+func EffectiveApprovalPolicy(plan RolloutPlan) ApprovalPolicy {
+	if plan.ApprovalPolicy == ApprovalPolicyDualRole {
+		return ApprovalPolicyDualRole
+	}
+	return ApprovalPolicyNone
+}
+
+// ApprovalMissingReason explains why the current ledger does not authorize
+// activation. Stable codes are returned in the error details.
+type ApprovalMissingReason string
+
+const (
+	ApprovalMissingRole  ApprovalMissingReason = "missing_role"
+	ApprovalRejected     ApprovalMissingReason = "rejected"
+	ApprovalSameApprover ApprovalMissingReason = "same_approver"
+	ApprovalConflicting  ApprovalMissingReason = "conflicting_records"
+)
+
+// ApprovalGate evaluates the independent approval ledger for a plan that is
+// about to activate. It accepts only still-valid dual-role "approved" records
+// bound to the exact current revision (by identity and immutable digest) and
+// current plan version. Withdrawn, expired, stale-revision or stale-version
+// records never authorize activation.
+func ApprovalGate(
+	plan RolloutPlan,
+	currentRevision ZoneRevision,
+	approvals []PlanApproval,
+	now time.Time,
+) (map[ApprovalRole]PlanApproval, error) {
+	matched := make(map[ApprovalRole][]PlanApproval)
+	now = now.UTC()
+	for _, approval := range approvals {
+		if approval.PlanID != plan.ID {
+			continue
+		}
+		if approval.Status != ApprovalStatusActive {
+			continue
+		}
+		if !approval.ExpiresAt.IsZero() && !now.Before(approval.ExpiresAt) {
+			continue
+		}
+		if approval.RevisionID != currentRevision.ID ||
+			approval.RevisionDigest != RevisionDigest(currentRevision) ||
+			approval.PlanVersion != plan.Version {
+			continue
+		}
+		if approval.Role != ApprovalRoleRiskReviewer && approval.Role != ApprovalRoleZoneOwner {
+			continue
+		}
+		matched[approval.Role] = append(matched[approval.Role], approval)
+	}
+
+	chosen := make(map[ApprovalRole]PlanApproval)
+	details := make(map[string]any)
+	for _, role := range []ApprovalRole{ApprovalRoleRiskReviewer, ApprovalRoleZoneOwner} {
+		records := matched[role]
+		if len(records) == 0 {
+			details[string(role)] = string(ApprovalMissingRole)
+			continue
+		}
+		sort.Slice(records, func(i, j int) bool {
+			return records[i].CreatedAt.Before(records[j].CreatedAt)
+		})
+		active := records[len(records)-1]
+		if active.Decision != ApprovalDecisionApproved {
+			details[string(role)] = string(ApprovalRejected)
+			continue
+		}
+		for _, record := range records[:len(records)-1] {
+			if record.Decision == ApprovalDecisionApproved {
+				details[string(role)] = string(ApprovalConflicting)
+				break
+			}
+		}
+		chosen[role] = active
+	}
+	if len(chosen) == 2 {
+		risk := chosen[ApprovalRoleRiskReviewer]
+		zone := chosen[ApprovalRoleZoneOwner]
+		if risk.Approver == zone.Approver {
+			return nil, InvalidState("dual-role approval requires two distinct approvers", map[string]any{
+				"plan_id": plan.ID,
+				"reason":  string(ApprovalSameApprover),
+			})
+		}
+		return chosen, nil
+	}
+	if _, exists := details["reason"]; !exists && len(details) > 0 {
+		details["plan_id"] = plan.ID
+	}
+	return nil, InvalidState("plan requires two valid role approvals before activation", details)
 }
 
 func timePointer(value time.Time) *time.Time {

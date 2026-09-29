@@ -16,13 +16,18 @@ const (
 	MinRequestKeyRunes = 8
 	MaxRequestKeyRunes = 64
 	MaxEntries         = 500
+	MaxApproverRunes   = 180
+	MaxApprovalNote    = 1000
+	MinApprovalTTL     = 600
+	MaxApprovalTTL     = 604800
 )
 
 type PlanCreateInput struct {
-	Zone                string  `json:"zone"`
-	MinimumSuccessRatio float64 `json:"minimum_success_ratio"`
-	MaximumLatencyMS    int     `json:"maximum_latency_ms"`
-	ExpectedNodes       int     `json:"expected_nodes"`
+	Zone                string         `json:"zone"`
+	MinimumSuccessRatio float64        `json:"minimum_success_ratio"`
+	MaximumLatencyMS    int            `json:"maximum_latency_ms"`
+	ExpectedNodes       int            `json:"expected_nodes"`
+	ApprovalPolicy      ApprovalPolicy `json:"approval_policy"`
 }
 
 type RevisionCreateInput struct {
@@ -56,8 +61,25 @@ type AssessmentInput struct {
 	RequestKey string `json:"request_key"`
 }
 
+type ApprovalCreateInput struct {
+	RequestKey       string           `json:"request_key"`
+	Role             ApprovalRole     `json:"role"`
+	Approver         string           `json:"approver"`
+	Decision         ApprovalDecision `json:"decision"`
+	Note             string           `json:"note"`
+	ExpiresInSeconds int              `json:"expires_in_seconds"`
+}
+
+type ApprovalWithdrawInput struct {
+	RequestKey string `json:"request_key"`
+	Approver   string `json:"approver"`
+}
+
 func NormalizePlanInput(input PlanCreateInput) PlanCreateInput {
 	input.Zone = canonicalName(input.Zone)
+	if input.ApprovalPolicy == "" {
+		input.ApprovalPolicy = ApprovalPolicyNone
+	}
 	return input
 }
 
@@ -76,8 +98,80 @@ func ValidatePlanInput(input PlanCreateInput) error {
 	if input.ExpectedNodes < 1 || input.ExpectedNodes > 500 {
 		details["expected_nodes"] = "must be between 1 and 500"
 	}
+	if input.ApprovalPolicy != ApprovalPolicyNone && input.ApprovalPolicy != ApprovalPolicyDualRole {
+		details["approval_policy"] = "must be none or dual_role"
+	}
 	if len(details) > 0 {
 		return Validation("plan input is invalid", details)
+	}
+	return nil
+}
+
+// NormalizeApprovalInput trims caller-supplied text. Approval content is never
+// taken from the activation request; approvers are case-sensitive identities.
+func NormalizeApprovalInput(input ApprovalCreateInput) ApprovalCreateInput {
+	input.RequestKey = strings.TrimSpace(input.RequestKey)
+	input.Approver = strings.TrimSpace(input.Approver)
+	input.Role = ApprovalRole(strings.TrimSpace(string(input.Role)))
+	input.Decision = ApprovalDecision(strings.TrimSpace(string(input.Decision)))
+	input.Note = strings.TrimSpace(input.Note)
+	return input
+}
+
+func ValidateApprovalInput(input ApprovalCreateInput) error {
+	details := make(map[string]any)
+	if err := validateRequestKey(input.RequestKey); err != nil {
+		details["request_key"] = err.Error()
+	}
+	if input.Role != ApprovalRoleRiskReviewer && input.Role != ApprovalRoleZoneOwner {
+		details["role"] = "must be risk_reviewer or zone_owner"
+	}
+	if input.Decision != ApprovalDecisionApproved && input.Decision != ApprovalDecisionRejected {
+		details["decision"] = "must be approved or rejected"
+	}
+	if err := validateApprover(input.Approver); err != nil {
+		details["approver"] = err.Error()
+	}
+	if input.ExpiresInSeconds != 0 && (input.ExpiresInSeconds < MinApprovalTTL || input.ExpiresInSeconds > MaxApprovalTTL) {
+		details["expires_in_seconds"] = "must be between 600 and 604800"
+	}
+	if utf8.RuneCountInString(input.Note) > MaxApprovalNote {
+		details["note"] = "must be at most 1000 characters"
+	}
+	if len(details) > 0 {
+		return Validation("approval input is invalid", details)
+	}
+	return nil
+}
+
+func ValidateApprovalWithdrawInput(input ApprovalWithdrawInput) error {
+	details := make(map[string]any)
+	if err := validateRequestKey(strings.TrimSpace(input.RequestKey)); err != nil {
+		details["request_key"] = err.Error()
+	}
+	if err := validateApprover(strings.TrimSpace(input.Approver)); err != nil {
+		details["approver"] = err.Error()
+	}
+	if len(details) > 0 {
+		return Validation("approval withdraw input is invalid", details)
+	}
+	return nil
+}
+
+func validateApprover(value string) error {
+	count := utf8.RuneCountInString(value)
+	if count < 1 || count > MaxApproverRunes {
+		return Validation("must contain between 1 and 180 characters", nil)
+	}
+	for _, r := range value {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' {
+			continue
+		}
+		switch r {
+		case '-', '_', '.', '@':
+			continue
+		}
+		return Validation("may contain only letters, digits, hyphens, underscores, dots, and at signs", nil)
 	}
 	return nil
 }

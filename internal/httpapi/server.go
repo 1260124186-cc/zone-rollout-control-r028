@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"solo-0014-zone-rollout-control/internal/allocation"
+	"solo-0014-zone-rollout-control/internal/approval"
 	"solo-0014-zone-rollout-control/internal/assessment"
 	"solo-0014-zone-rollout-control/internal/fleet"
 	"solo-0014-zone-rollout-control/internal/plan"
@@ -18,6 +19,7 @@ type Server struct {
 	allocations *allocation.Service
 	probes      *probe.Service
 	assessments *assessment.Service
+	approvals   *approval.Service
 	ids         platform.IDGenerator
 	logger      *slog.Logger
 }
@@ -28,6 +30,7 @@ func New(
 	allocations *allocation.Service,
 	probes *probe.Service,
 	assessments *assessment.Service,
+	approvals *approval.Service,
 	ids platform.IDGenerator,
 	logger *slog.Logger,
 ) *Server {
@@ -37,6 +40,7 @@ func New(
 		allocations: allocations,
 		probes:      probes,
 		assessments: assessments,
+		approvals:   approvals,
 		ids:         ids,
 		logger:      logger,
 	}

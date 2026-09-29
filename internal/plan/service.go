@@ -2,7 +2,6 @@ package plan
 
 import (
 	"context"
-	"encoding/json"
 	"reflect"
 	"sort"
 
@@ -34,6 +33,7 @@ func (s *Service) Create(ctx context.Context, input domain.PlanCreateInput) (dom
 		MinimumSuccessRatio: input.MinimumSuccessRatio,
 		MaximumLatencyMS:    input.MaximumLatencyMS,
 		ExpectedNodes:       input.ExpectedNodes,
+		ApprovalPolicy:      input.ApprovalPolicy,
 		Version:             1,
 		CreatedAt:           now,
 	}
@@ -126,6 +126,41 @@ func (s *Service) Activate(
 			return versionConflict(planID, expectedVersion, current.Version)
 		}
 		now := s.clock.Now().UTC()
+		if domain.EffectiveApprovalPolicy(current) == domain.ApprovalPolicyDualRole {
+			if current.LatestRevisionID == "" {
+				return domain.InvalidState("plan needs a zone revision before activation", map[string]any{
+					"plan_id": planID,
+				})
+			}
+			revision, ok := state.Revisions[current.LatestRevisionID]
+			if !ok {
+				return domain.NewError(domain.CodeStorageFailure, "plan references a missing revision", map[string]any{
+					"revision_id": current.LatestRevisionID,
+				})
+			}
+			ledger := make([]domain.PlanApproval, 0, len(state.Approvals))
+			for _, approval := range state.Approvals {
+				if approval.PlanID == planID {
+					ledger = append(ledger, approval)
+				}
+			}
+			accepted, err := domain.ApprovalGate(current, revision, ledger, now)
+			if err != nil {
+				return err
+			}
+			if err := domain.ActivatePlan(&current, now); err != nil {
+				return err
+			}
+			state.Plans[planID] = current
+			store.AddAudit(state, s.ids, "plan", planID, "activated", now, map[string]any{
+				"version":                current.Version,
+				"approval_policy":        string(domain.ApprovalPolicyDualRole),
+				"risk_reviewer_approval": accepted[domain.ApprovalRoleRiskReviewer].ID,
+				"zone_owner_approval":    accepted[domain.ApprovalRoleZoneOwner].ID,
+			})
+			plan = current
+			return nil
+		}
 		if err := domain.ActivatePlan(&current, now); err != nil {
 			return err
 		}
@@ -268,19 +303,6 @@ func (s *Service) RevisionExists(
 		return nil
 	})
 	return exists, err
-}
-
-func RevisionDigest(revision domain.ZoneRevision) string {
-	payload, _ := json.Marshal(struct {
-		Serial    uint32
-		Authority string
-		Entries   []domain.ZoneEntry
-	}{
-		Serial:    revision.Serial,
-		Authority: revision.Authority,
-		Entries:   revision.Entries,
-	})
-	return string(payload)
 }
 
 func versionConflict(id string, expected uint64, actual uint64) *domain.DomainError {
